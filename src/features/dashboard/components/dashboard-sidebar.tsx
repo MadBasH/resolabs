@@ -149,8 +149,8 @@ export function DashboardSidebar() {
           <Image
             src="/logo.svg"
             alt="Resolabs"
-            width={64}
-            height={64}
+            width={100}
+            height={100}
             className="rounded-sm"
           />
           <span className="group-data-[collapsible=icon]:hidden font-semibold text-lg tracking-tighter text-foreground">
