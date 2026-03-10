@@ -1,30 +1,35 @@
-import { clerkMiddleware, createRouteMatcher } from '@clerk/nextjs/server';
-import { NextResponse } from 'next/server';
+import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
+import { NextResponse } from "next/server";
 
 const isPublicRoute = createRouteMatcher(["/sign-in(.*)", "/sign-up(.*)"]);
 
 const isOrgSelectionRoute = createRouteMatcher(["/org-selection(.*)"]);
 
 export default clerkMiddleware(async (auth, req) => {
-    const { userId, orgId } = await auth();
-    if (isPublicRoute(req)) {
-        return NextResponse.next();
-    }
+  const { userId, orgId } = await auth();
 
-    if (!userId) {
-        await auth.protect();
-    }
-
-    if (isOrgSelectionRoute(req)) {
-        return NextResponse.next();
-    }
-
-    if (userId && !orgId) {
-        const orgSelection = new URL("/org-selection", req.url);
-        return NextResponse.redirect(orgSelection);
-    }
-
+  // Allow public routes
+  if (isPublicRoute(req)) {
     return NextResponse.next();
+  }
+
+  // Protect non-public routes
+  if (!userId) {
+    await auth.protect();
+  }
+
+  // Allow org selection page
+  if (isOrgSelectionRoute(req)) {
+    return NextResponse.next();
+  }
+
+  // For all protected routes, ensure org is selected
+  if (userId && !orgId) {
+    const orgSelection = new URL("/org-selection", req.url);
+    return NextResponse.redirect(orgSelection);
+  }
+
+  return NextResponse.next();
 });
 
 export const config = {

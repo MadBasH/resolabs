@@ -33,8 +33,8 @@ import {
   Headphones,
 } from "lucide-react";
 import Link from "next/link";
-//import { UsageContainer } from "@/features/billing/components/usage-container";
-//import { VoiceCreateDialog } from "@/features/voices/components/voice-create-dialog";
+import { UsageContainer } from "@/features/billing/components/usage-container";
+import { VoiceCreateDialog } from "@/features/voices/components/voice-create-dialog";
 import { useState } from "react";
 
 interface MenuItem {
@@ -131,17 +131,17 @@ export function DashboardSidebar() {
     },
     {
       title: "Help and support",
-      url: "mailto:supresolabs@gmail.com",
+      url: "mailto:business@codewithantonio.com",
       icon: Headphones,
     },
   ];
 
   return (
     <>
-    {/* <VoiceCreateDialog
+    <VoiceCreateDialog
       open={voiceDialogOpen}
       onOpenChange={setVoiceDialogOpen}
-    /> */}
+    />
     <Sidebar collapsible="icon">
       <SidebarHeader className="flex flex-col gap-4 pt-4">
         <div 
@@ -149,8 +149,8 @@ export function DashboardSidebar() {
           <Image
             src="/logo.svg"
             alt="Resolabs"
-            width={100}
-            height={100}
+            width={96}
+            height={96}
             className="rounded-sm"
           />
           <span className="group-data-[collapsible=icon]:hidden font-semibold text-lg tracking-tighter text-foreground">
@@ -197,7 +197,7 @@ export function DashboardSidebar() {
       </SidebarContent>
       <div className="border-b border-dashed border-border" />
       <SidebarFooter className="gap-3 py-3">
-        {/* <UsageContainer /> */}
+        <UsageContainer />
         <SidebarMenu>
           <SidebarMenuItem>
             <UserButton
