@@ -1,9 +1,9 @@
-"""XTTS v2 API - Text-to-speech with voice cloning on Modal."""
+"""XTTS v2 API - Text-to-speech with Auto-Language Detection on Modal."""
 
 import modal
 import os
 
-# R2 cloud bucket mount (read-only, replaces Modal Volume)
+# R2 cloud bucket mount (read-only)
 R2_BUCKET_NAME = "resolabs-app"
 R2_ACCOUNT_ID = "de31186ed80914fd17e2219c23eefa03"
 R2_MOUNT_PATH = "/r2"
@@ -14,16 +14,17 @@ r2_bucket = modal.CloudBucketMount(
     read_only=True,
 )
 
-# Modal setup: Added libsndfile1 and ffmpeg which are usually required by TTS
+# Modal setup: Added langdetect
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("libsndfile1", "ffmpeg")
     .pip_install(
         "TTS==0.22.0",
         "fastapi[standard]==0.124.4",
-        "torch==2.4.0",            # PyTorch sürümünü güncelledik
-        "torchaudio==2.4.0",       # PyTorch ile uyumlu torchaudio
-        "transformers==4.37.2",    # BeamSearchScorer hatasını çözen sihirli satır
+        "torch==2.4.0",
+        "torchaudio==2.4.0",
+        "transformers==4.37.2",
+        "langdetect==1.0.9", # Dil algılama kütüphanesi eklendi
     )
 )
 app = modal.App("xtts-api", image=image)
@@ -55,8 +56,9 @@ with image.imports():
         """Request model for text-to-speech generation."""
         prompt: str = Field(..., min_length=1, max_length=5000)
         voice_key: str = Field(..., min_length=1, max_length=300)
-        language: str = Field(default="tr", min_length=2, max_length=5) # Added language support
-        speed: float = Field(default=1.0, ge=0.5, le=2.0) # Replaced chatterbox specific params with speed
+        # Dil artık varsayılan olarak "auto" geliyor
+        language: str = Field(default="auto", min_length=2, max_length=5) 
+        speed: float = Field(default=1.0, ge=0.5, le=2.0)
 
 
 @app.cls(
@@ -73,18 +75,15 @@ with image.imports():
 class XTTSGenerator:
     @modal.enter()
     def load_model(self):
-        # Auto-agree to Coqui Terms of Service to prevent download block
         os.environ["COQUI_TOS_AGREED"] = "1"
         from TTS.api import TTS
-        
-        # This downloads the model to Modal's container on first boot
         self.model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
 
     @modal.asgi_app()
     def serve(self):
         web_app = FastAPI(
             title="XTTS Voice Cloning API",
-            description="High-quality Text-to-speech with voice cloning for Turkish and more.",
+            description="High-quality Text-to-speech with auto-language detection.",
             docs_url="/docs",
             dependencies=[Depends(verify_api_key)],
         )
@@ -129,10 +128,25 @@ class XTTSGenerator:
         self,
         prompt: str,
         audio_prompt_path: str,
-        language: str = "tr",
+        language: str = "auto",
         speed: float = 1.0,
     ):
-        # XTTS generates a list of floats
+        # Eğer dil 'auto' olarak geldiyse, metni analiz et
+        if language == "auto":
+            from langdetect import detect
+            try:
+                detected_lang = detect(prompt)
+                # XTTS'nin desteklediği başlıca dillerin listesi
+                supported_langs = ["en", "tr", "de", "fr", "es", "it", "pt", "pl", "ru", "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi"]
+                
+                if detected_lang in supported_langs:
+                    language = detected_lang
+                    print(f"Dil otomatik algılandı: {language}")
+                else:
+                    language = "tr" # Desteklenmeyen bir dilse Türkçeye dön (fallback)
+            except:
+                language = "tr" # Algılama başarısız olursa Türkçeye dön
+
         wav_data = self.model.tts(
             text=prompt,
             speaker_wav=audio_prompt_path,
@@ -140,10 +154,7 @@ class XTTSGenerator:
             speed=speed
         )
 
-        # Convert list of floats to PyTorch tensor [Channels, Time]
         wav_tensor = torch.tensor(wav_data).unsqueeze(0)
-
-        # XTTS v2 uses a 24000 Hz sample rate
         sample_rate = 24000
 
         buffer = io.BytesIO()
@@ -154,17 +165,16 @@ class XTTSGenerator:
 
 @app.local_entrypoint()
 def test(
-    prompt: str = "Merhaba, bu XTTS v2 ile oluşturulmuş, yüksek kaliteli bir Türkçe ses testidir.",
+    prompt: str = "Hello, how are you today? This is an English test.",
     voice_key: str = "voices/system/default.wav",
     output_path: str = "/tmp/xtts-api/output.wav",
-    language: str = "tr",
+    language: str = "auto",
 ):
     import pathlib
 
     generator = XTTSGenerator()
     audio_prompt_path = f"{R2_MOUNT_PATH}/{voice_key}"
     
-    print("Generating audio... This might take a bit longer on the first run as the model downloads.")
     audio_bytes = generator.generate.remote(
         prompt=prompt,
         audio_prompt_path=audio_prompt_path,
