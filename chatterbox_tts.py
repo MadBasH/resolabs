@@ -1,23 +1,7 @@
-"""Chatterbox TTS API - Text-to-speech with voice cloning on Modal."""
+"""XTTS v2 API - Text-to-speech with voice cloning on Modal."""
 
 import modal
-
-# Use this to add R2 tokens:
-# modal secret create cloudflare-r2 \
-#   AWS_ACCESS_KEY_ID=<r2-access-key-id> \
-#   AWS_SECRET_ACCESS_KEY=<r2-secret-access-key>
-
-# Use this to test locally:
-# modal run chatterbox_tts.py \
-#   --prompt "Merhaba, bu bir Türkçe ses testi." \
-#   --voice-key "voices/system/<voice-id>"
-
-# Use this to test CURL:
-# curl -X POST "https://<your-modal-endpoint>/generate" \
-#   -H "Content-Type: application/json" \
-#   -H "X-Api-Key: <your-api-key>" \
-#   -d '{"prompt": "Merhaba, bu bir Türkçe ses testi.", "voice_key": "voices/system/<voice-id>"}' \
-#   --output output.wav
+import os
 
 # R2 cloud bucket mount (read-only, replaces Modal Volume)
 R2_BUCKET_NAME = "resolabs-app"
@@ -30,27 +14,26 @@ r2_bucket = modal.CloudBucketMount(
     read_only=True,
 )
 
-# Modal setup
-image = modal.Image.debian_slim(python_version="3.10").uv_pip_install(
-    "chatterbox-tts==0.1.6",
-    "fastapi[standard]==0.124.4",
-    "peft==0.18.0",
+# Modal setup: Added libsndfile1 and ffmpeg which are usually required by TTS
+image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("libsndfile1", "ffmpeg")
+    .pip_install(
+        "TTS==0.22.0",
+        "fastapi[standard]==0.124.4",
+        "torch==2.4.0",            # PyTorch sürümünü güncelledik
+        "torchaudio==2.4.0",       # PyTorch ile uyumlu torchaudio
+        "transformers==4.37.2",    # BeamSearchScorer hatasını çözen sihirli satır
+    )
 )
-app = modal.App("chatterbox-tts", image=image)
+app = modal.App("xtts-api", image=image)
 
 with image.imports():
     import io
-    import os
     from pathlib import Path
-
+    import torch
     import torchaudio as ta
-    from chatterbox.tts_turbo import ChatterboxTurboTTS
-    from fastapi import (
-        Depends,
-        FastAPI,
-        HTTPException,
-        Security,
-    )
+    from fastapi import Depends, FastAPI, HTTPException, Security
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse
     from fastapi.security import APIKeyHeader
@@ -70,14 +53,10 @@ with image.imports():
 
     class TTSRequest(BaseModel):
         """Request model for text-to-speech generation."""
-
         prompt: str = Field(..., min_length=1, max_length=5000)
         voice_key: str = Field(..., min_length=1, max_length=300)
-        temperature: float = Field(default=0.5, ge=0.0, le=2.0)
-        top_p: float = Field(default=0.85, ge=0.0, le=1.0)
-        top_k: int = Field(default=50, ge=1, le=10000)
-        repetition_penalty: float = Field(default=1.3, ge=1.0, le=2.0)
-        norm_loudness: bool = Field(default=True)
+        language: str = Field(default="tr", min_length=2, max_length=5) # Added language support
+        speed: float = Field(default=1.0, ge=0.5, le=2.0) # Replaced chatterbox specific params with speed
 
 
 @app.cls(
@@ -91,16 +70,21 @@ with image.imports():
     volumes={R2_MOUNT_PATH: r2_bucket},
 )
 @modal.concurrent(max_inputs=10)
-class Chatterbox:
+class XTTSGenerator:
     @modal.enter()
     def load_model(self):
-        self.model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+        # Auto-agree to Coqui Terms of Service to prevent download block
+        os.environ["COQUI_TOS_AGREED"] = "1"
+        from TTS.api import TTS
+        
+        # This downloads the model to Modal's container on first boot
+        self.model = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cuda")
 
     @modal.asgi_app()
     def serve(self):
         web_app = FastAPI(
-            title="Chatterbox TTS API",
-            description="Text-to-speech with voice cloning",
+            title="XTTS Voice Cloning API",
+            description="High-quality Text-to-speech with voice cloning for Turkish and more.",
             docs_url="/docs",
             dependencies=[Depends(verify_api_key)],
         )
@@ -125,11 +109,8 @@ class Chatterbox:
                 audio_bytes = self.generate.local(
                     request.prompt,
                     str(voice_path),
-                    request.temperature,
-                    request.top_p,
-                    request.top_k,
-                    request.repetition_penalty,
-                    request.norm_loudness,
+                    request.language,
+                    request.speed,
                 )
                 return StreamingResponse(
                     io.BytesIO(audio_bytes),
@@ -148,51 +129,46 @@ class Chatterbox:
         self,
         prompt: str,
         audio_prompt_path: str,
-        temperature: float = 0.5,
-        top_p: float = 0.85,
-        top_k: int = 50,
-        repetition_penalty: float = 1.3,
-        norm_loudness: bool = True,
+        language: str = "tr",
+        speed: float = 1.0,
     ):
-        wav = self.model.generate(
-            prompt,
-            audio_prompt_path=audio_prompt_path,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            repetition_penalty=repetition_penalty,
-            norm_loudness=norm_loudness,
+        # XTTS generates a list of floats
+        wav_data = self.model.tts(
+            text=prompt,
+            speaker_wav=audio_prompt_path,
+            language=language,
+            speed=speed
         )
 
+        # Convert list of floats to PyTorch tensor [Channels, Time]
+        wav_tensor = torch.tensor(wav_data).unsqueeze(0)
+
+        # XTTS v2 uses a 24000 Hz sample rate
+        sample_rate = 24000
+
         buffer = io.BytesIO()
-        ta.save(buffer, wav, self.model.sr, format="wav")
+        ta.save(buffer, wav_tensor, sample_rate, format="wav")
         buffer.seek(0)
         return buffer.read()
 
 
 @app.local_entrypoint()
 def test(
-    prompt: str = "Merhaba, bu bir Türkçe ses testi.",
+    prompt: str = "Merhaba, bu XTTS v2 ile oluşturulmuş, yüksek kaliteli bir Türkçe ses testidir.",
     voice_key: str = "voices/system/default.wav",
-    output_path: str = "/tmp/chatterbox-tts/output.wav",
-    temperature: float = 0.5,
-    top_p: float = 0.85,
-    top_k: int = 50,
-    repetition_penalty: float = 1.3,
-    norm_loudness: bool = True,
+    output_path: str = "/tmp/xtts-api/output.wav",
+    language: str = "tr",
 ):
     import pathlib
 
-    chatterbox = Chatterbox()
+    generator = XTTSGenerator()
     audio_prompt_path = f"{R2_MOUNT_PATH}/{voice_key}"
-    audio_bytes = chatterbox.generate.remote(
+    
+    print("Generating audio... This might take a bit longer on the first run as the model downloads.")
+    audio_bytes = generator.generate.remote(
         prompt=prompt,
         audio_prompt_path=audio_prompt_path,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        repetition_penalty=repetition_penalty,
-        norm_loudness=norm_loudness,
+        language=language,
     )
 
     output_file = pathlib.Path(output_path)
