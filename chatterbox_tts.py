@@ -1,7 +1,25 @@
-"""XTTS v2 TTS API - Multilingual TTS with voice cloning on Modal."""
+"""Chatterbox TTS API - Text-to-speech with voice cloning on Modal."""
 
 import modal
 
+# Use this to add R2 tokens:
+# modal secret create cloudflare-r2 \
+#   AWS_ACCESS_KEY_ID=<r2-access-key-id> \
+#   AWS_SECRET_ACCESS_KEY=<r2-secret-access-key>
+
+# Use this to test locally:
+# modal run chatterbox_tts.py \
+#   --prompt "Merhaba, bu bir Türkçe ses testi." \
+#   --voice-key "voices/system/<voice-id>"
+
+# Use this to test CURL:
+# curl -X POST "https://<your-modal-endpoint>/generate" \
+#   -H "Content-Type: application/json" \
+#   -H "X-Api-Key: <your-api-key>" \
+#   -d '{"prompt": "Merhaba, bu bir Türkçe ses testi.", "voice_key": "voices/system/<voice-id>"}' \
+#   --output output.wav
+
+# R2 cloud bucket mount (read-only, replaces Modal Volume)
 R2_BUCKET_NAME = "resolabs-app"
 R2_ACCOUNT_ID = "de31186ed80914fd17e2219c23eefa03"
 R2_MOUNT_PATH = "/r2"
@@ -12,141 +30,171 @@ r2_bucket = modal.CloudBucketMount(
     read_only=True,
 )
 
-# Install in layers: torch first, then transformers pinned, then TTS
-image = (
-    modal.Image.debian_slim(python_version="3.10")
-    .apt_install("libsndfile1", "ffmpeg")
-    .pip_install("torch==2.4.1", "torchaudio==2.4.1", "numpy<2.0")
-    .pip_install("transformers==4.37.2")  # last version with BeamSearchScorer
-    .pip_install("TTS==0.22.0", "fastapi[standard]==0.115.0")
+# Modal setup
+image = modal.Image.debian_slim(python_version="3.10").uv_pip_install(
+    "chatterbox-tts==0.1.6",
+    "fastapi[standard]==0.124.4",
+    "peft==0.18.0",
 )
-app = modal.App("xtts-tts", image=image)
+app = modal.App("chatterbox-tts", image=image)
 
 with image.imports():
     import io
     import os
     from pathlib import Path
 
-    import torch
     import torchaudio as ta
-    from TTS.api import TTS
-    from fastapi import Depends, FastAPI, HTTPException, Security
+    from chatterbox.tts_turbo import ChatterboxTurboTTS
+    from fastapi import (
+        Depends,
+        FastAPI,
+        HTTPException,
+        Security,
+    )
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse
     from fastapi.security import APIKeyHeader
     from pydantic import BaseModel, Field
 
-    SUPPORTED_LANGUAGES = [
-        "tr", "en", "es", "fr", "de", "it", "pt", "pl",
-        "nl", "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi", "ru"
-    ]
-
-    api_key_scheme = APIKeyHeader(name="x-api-key", scheme_name="ApiKeyAuth", auto_error=False)
+    api_key_scheme = APIKeyHeader(
+        name="x-api-key",
+        scheme_name="ApiKeyAuth",
+        auto_error=False,
+    )
 
     def verify_api_key(x_api_key: str | None = Security(api_key_scheme)):
-        expected = os.environ.get("XTTS_API_KEY", "")
+        expected = os.environ.get("CHATTERBOX_API_KEY", "")
         if not expected or x_api_key != expected:
             raise HTTPException(status_code=403, detail="Invalid API key")
         return x_api_key
 
     class TTSRequest(BaseModel):
+        """Request model for text-to-speech generation."""
+
         prompt: str = Field(..., min_length=1, max_length=5000)
         voice_key: str = Field(..., min_length=1, max_length=300)
-        language: str = Field(default="tr")
-        temperature: float = Field(default=0.75, ge=0.0, le=1.0)
-        length_penalty: float = Field(default=1.0, ge=0.5, le=2.0)
-        repetition_penalty: float = Field(default=5.0, ge=1.0, le=10.0)
-        top_k: int = Field(default=50, ge=1, le=100)
+        temperature: float = Field(default=0.5, ge=0.0, le=2.0)
         top_p: float = Field(default=0.85, ge=0.0, le=1.0)
-        speed: float = Field(default=1.0, ge=0.5, le=2.0)
+        top_k: int = Field(default=50, ge=1, le=10000)
+        repetition_penalty: float = Field(default=1.3, ge=1.0, le=2.0)
+        norm_loudness: bool = Field(default=True)
 
 
 @app.cls(
     gpu="a10g",
     scaledown_window=60 * 5,
     secrets=[
-        modal.Secret.from_name("xtts-api-key"),
+        modal.Secret.from_name("hf-token"),
+        modal.Secret.from_name("chatterbox-api-key"),
         modal.Secret.from_name("cloudflare-r2"),
     ],
     volumes={R2_MOUNT_PATH: r2_bucket},
-    timeout=120,
 )
-@modal.concurrent(max_inputs=5)
-class XTTS:
+@modal.concurrent(max_inputs=10)
+class Chatterbox:
     @modal.enter()
     def load_model(self):
-        print("Loading XTTS v2 model...")
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        os.environ["COQUI_TOS_AGREED"] = "1"
-        self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(self.device)
-        print(f"XTTS v2 loaded on {self.device}")
+        self.model = ChatterboxTurboTTS.from_pretrained(device="cuda")
 
     @modal.asgi_app()
     def serve(self):
         web_app = FastAPI(
-            title="XTTS v2 TTS API",
+            title="Chatterbox TTS API",
+            description="Text-to-speech with voice cloning",
             docs_url="/docs",
             dependencies=[Depends(verify_api_key)],
         )
-        web_app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-        @web_app.get("/languages")
-        def list_languages():
-            return {"supported_languages": SUPPORTED_LANGUAGES}
+        web_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
 
         @web_app.post("/generate", responses={200: {"content": {"audio/wav": {}}}})
         def generate_speech(request: TTSRequest):
-            if request.language not in SUPPORTED_LANGUAGES:
-                raise HTTPException(status_code=400, detail=f"Language '{request.language}' not supported.")
             voice_path = Path(R2_MOUNT_PATH) / request.voice_key
             if not voice_path.exists():
-                raise HTTPException(status_code=400, detail=f"Voice file not found at '{request.voice_key}'")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Voice not found at '{request.voice_key}'",
+                )
+
             try:
                 audio_bytes = self.generate.local(
-                    text=request.prompt, speaker_wav=str(voice_path), language=request.language,
-                    temperature=request.temperature, length_penalty=request.length_penalty,
-                    repetition_penalty=request.repetition_penalty, top_k=request.top_k,
-                    top_p=request.top_p, speed=request.speed,
+                    request.prompt,
+                    str(voice_path),
+                    request.temperature,
+                    request.top_p,
+                    request.top_k,
+                    request.repetition_penalty,
+                    request.norm_loudness,
                 )
-                return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/wav", headers={"X-Language": request.language})
+                return StreamingResponse(
+                    io.BytesIO(audio_bytes),
+                    media_type="audio/wav",
+                )
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to generate audio: {e}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to generate audio: {e}",
+                )
 
         return web_app
 
     @modal.method()
-    def generate(self, text: str, speaker_wav: str, language: str = "tr",
-                 temperature: float = 0.75, length_penalty: float = 1.0,
-                 repetition_penalty: float = 5.0, top_k: int = 50,
-                 top_p: float = 0.85, speed: float = 1.0) -> bytes:
-        wav = self.tts.tts(
-            text=text, speaker_wav=speaker_wav, language=language,
-            temperature=temperature, length_penalty=length_penalty,
-            repetition_penalty=repetition_penalty, top_k=top_k, top_p=top_p, speed=speed,
+    def generate(
+        self,
+        prompt: str,
+        audio_prompt_path: str,
+        temperature: float = 0.5,
+        top_p: float = 0.85,
+        top_k: int = 50,
+        repetition_penalty: float = 1.3,
+        norm_loudness: bool = True,
+    ):
+        wav = self.model.generate(
+            prompt,
+            audio_prompt_path=audio_prompt_path,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            norm_loudness=norm_loudness,
         )
-        wav_tensor = torch.tensor(wav).unsqueeze(0)
+
         buffer = io.BytesIO()
-        ta.save(buffer, wav_tensor, self.tts.synthesizer.output_sample_rate, format="wav")
+        ta.save(buffer, wav, self.model.sr, format="wav")
         buffer.seek(0)
         return buffer.read()
 
 
 @app.local_entrypoint()
 def test(
-    prompt: str = "Merhaba! Bu, Türkçe ses sentezi testidir.",
+    prompt: str = "Merhaba, bu bir Türkçe ses testi.",
     voice_key: str = "voices/system/default.wav",
-    language: str = "tr",
-    output_path: str = "C:/Users/USER/resolabs/output.wav",
-    temperature: float = 0.75,
-    speed: float = 1.0,
+    output_path: str = "/tmp/chatterbox-tts/output.wav",
+    temperature: float = 0.5,
+    top_p: float = 0.85,
+    top_k: int = 50,
+    repetition_penalty: float = 1.3,
+    norm_loudness: bool = True,
 ):
     import pathlib
-    xtts = XTTS()
-    print(f"Generating '{language}' speech for: {prompt[:60]}...")
-    audio_bytes = xtts.generate.remote(
-        text=prompt, speaker_wav=f"{R2_MOUNT_PATH}/{voice_key}",
-        language=language, temperature=temperature, speed=speed,
+
+    chatterbox = Chatterbox()
+    audio_prompt_path = f"{R2_MOUNT_PATH}/{voice_key}"
+    audio_bytes = chatterbox.generate.remote(
+        prompt=prompt,
+        audio_prompt_path=audio_prompt_path,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        repetition_penalty=repetition_penalty,
+        norm_loudness=norm_loudness,
     )
+
     output_file = pathlib.Path(output_path)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     output_file.write_bytes(audio_bytes)
